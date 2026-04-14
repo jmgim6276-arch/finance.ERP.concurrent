@@ -1097,34 +1097,41 @@ def build_provider_payloads(data):
 
 
 def build_subject_payloads(data):
+    subject_paths = [
+        tuple(normalize_text(part) for part in item["path"] if normalize_text(part))
+        for item in data["subjects"]
+    ]
     subject_index = unique_index(
         data["subjects"],
         lambda item: tuple(normalize_text(part) for part in item["path"]),
     )
 
-    def find_best_subject(path):
-        normalized_path = [normalize_text(part) for part in path]
-        matches = []
-        for start in range(len(normalized_path)):
-            key = tuple(normalized_path[start:])
-            candidate = subject_index.get(key)
-            if candidate is not None:
-                matches.append((len(key), candidate))
-        if not matches:
-            return None
-        max_len = max(length for length, _ in matches)
-        best = [candidate for length, candidate in matches if length == max_len]
-        if len(best) != 1:
-            return None
-        return best[0]
+    def classify_subject_path(path):
+        normalized_path = tuple(normalize_text(part) for part in path if normalize_text(part))
+        if not normalized_path:
+            return None, "empty_path"
+        exact_candidate = subject_index.get(normalized_path)
+        if exact_candidate is not None:
+            return exact_candidate, "full_path_exact"
+        for start in range(1, len(normalized_path)):
+            suffix_key = normalized_path[start:]
+            if suffix_key and any(candidate_path[-len(suffix_key) :] == suffix_key for candidate_path in subject_paths):
+                return None, "hierarchy_mismatch"
+        return None, "no_match"
 
     def update_rows(rows, current_name_key, current_id_key, target_id_key, target_name_key):
         payload = []
         skipped = []
         for item in sorted(rows, key=lambda row: len(row["path"]), reverse=True):
-            candidate = find_best_subject(item["path"])
+            candidate, reason = classify_subject_path(item["path"])
             if candidate is None:
-                skipped.append({"path": item["path"], "reason": "no_match"})
+                current_id = item["row"].get(current_id_key)
+                if current_id is not None and reason == "hierarchy_mismatch":
+                    row = dict(item["row"])
+                    row[target_id_key] = None
+                    row[target_name_key] = None
+                    payload.append(row)
+                skipped.append({"path": item["path"], "reason": reason})
                 continue
             row = dict(item["row"])
             if row.get(current_id_key) == candidate["subject"]["id"]:
