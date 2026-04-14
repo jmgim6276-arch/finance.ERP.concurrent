@@ -4,6 +4,8 @@ import getpass
 import hashlib
 import json
 import os
+import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -11,6 +13,8 @@ from urllib.parse import quote
 
 import requests
 import websocket
+from runtime_context import browser_choices as runtime_browser_choices
+from runtime_context import release_browser_runtime
 
 BASE_URL = "https://cst.uf-tree.com"
 LOGIN_URL = f"{BASE_URL}/login"
@@ -19,17 +23,17 @@ BILL_TEMPLATE_URL = f"{BASE_URL}/bill/bills"
 BROWSERS = [
     {
         "name": "Edge",
-        "port": 9223,
-        "url": "http://localhost:9223/json",
+        "port": 29523,
+        "url": "http://localhost:29523/json",
         "binary": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "profile_dir": str(Path.home() / ".finance-cst" / "edge-cdp-profile"),
+        "profile_dir": str(Path.home() / ".finance-cst-erp" / "edge-cdp-profile"),
     },
     {
         "name": "Chrome",
-        "port": 18800,
-        "url": "http://localhost:18800/json",
+        "port": 29580,
+        "url": "http://localhost:29580/json",
         "binary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "profile_dir": str(Path.home() / ".finance-cst" / "chrome-cdp-profile"),
+        "profile_dir": str(Path.home() / ".finance-cst-erp" / "chrome-cdp-profile"),
     },
 ]
 
@@ -562,22 +566,17 @@ def sha1_hex(value):
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
-def browser_choices(preferred="auto"):
-    preferred = (preferred or "auto").lower()
-    if preferred == "edge":
-        return [b for b in BROWSERS if b["name"] == "Edge"]
-    if preferred == "chrome":
-        return [b for b in BROWSERS if b["name"] == "Chrome"]
-    return BROWSERS
+def browser_choices(preferred="auto", task_id=None):
+    return runtime_browser_choices(preferred=preferred, task_id=task_id)
 
 
 def list_pages(browser):
     return requests.get(browser["url"], timeout=6).json()
 
 
-def find_browser(preferred="auto", require_cst=False):
+def find_browser(preferred="auto", require_cst=False, task_id=None):
     available = []
-    for browser in browser_choices(preferred):
+    for browser in browser_choices(preferred, task_id=task_id):
         try:
             pages = list_pages(browser)
             has_cst = any("cst.uf-tree.com" in p.get("url", "") for p in pages)
@@ -606,8 +605,8 @@ def wait_for_browser(browser, timeout=20):
     return False
 
 
-def launch_browser(preferred="auto", target_url=LOGIN_URL):
-    for browser in browser_choices(preferred):
+def launch_browser(preferred="auto", target_url=LOGIN_URL, task_id=None):
+    for browser in browser_choices(preferred, task_id=task_id):
         binary = Path(browser["binary"])
         if not binary.exists():
             continue
@@ -632,11 +631,11 @@ def launch_browser(preferred="auto", target_url=LOGIN_URL):
     return None
 
 
-def find_or_launch_browser(preferred="auto", target_url=LOGIN_URL):
-    browser = find_browser(preferred=preferred, require_cst=False)
+def find_or_launch_browser(preferred="auto", target_url=LOGIN_URL, task_id=None):
+    browser = find_browser(preferred=preferred, require_cst=False, task_id=task_id)
     if browser:
         return browser
-    return launch_browser(preferred=preferred, target_url=target_url)
+    return launch_browser(preferred=preferred, target_url=target_url, task_id=task_id)
 
 
 def open_target(browser, url):
@@ -674,6 +673,100 @@ def close_page(browser, page):
         return True
     except Exception:
         return False
+
+
+def is_port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def list_browser_processes(browser):
+    patterns = [
+        browser["profile_dir"],
+        f"--remote-debugging-port={browser['port']}",
+    ]
+    matches = {}
+    result = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ps failed for {browser['name']}: {result.stderr.strip()}")
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pid_text, _, cmd = line.partition(" ")
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == os.getpid():
+            continue
+        if any(pattern in cmd for pattern in patterns):
+            matches[pid] = cmd
+    return [{"pid": pid, "cmd": cmd} for pid, cmd in sorted(matches.items())]
+
+
+def format_processes(processes):
+    return "; ".join(f"{item['pid']} {item['cmd']}" for item in processes)
+
+
+def wait_for_browser_exit(browser, timeout):
+    deadline = time.time() + timeout
+    latest_processes = list_browser_processes(browser)
+    latest_port_open = is_port_open(browser["port"])
+    clear_checks = 0
+    while time.time() < deadline:
+        latest_processes = list_browser_processes(browser)
+        latest_port_open = is_port_open(browser["port"])
+        if not latest_processes and not latest_port_open:
+            clear_checks += 1
+            if clear_checks >= 2:
+                return True, latest_processes, latest_port_open
+        else:
+            clear_checks = 0
+        time.sleep(0.25)
+    latest_processes = list_browser_processes(browser)
+    latest_port_open = is_port_open(browser["port"])
+    return (not latest_processes and not latest_port_open), latest_processes, latest_port_open
+
+
+def close_browser_instance(browser, timeout=5.0):
+    before_processes = list_browser_processes(browser)
+    before_port_open = is_port_open(browser["port"])
+    if not before_processes and not before_port_open:
+        return True, f"ℹ️ {browser['name']} ERP 自动化浏览器本来就是关闭状态"
+
+    for process in before_processes:
+        try:
+            os.kill(process["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+
+    closed, remaining_processes, remaining_port_open = wait_for_browser_exit(
+        browser,
+        timeout=min(max(timeout, 0.5), 3.0),
+    )
+    if not closed:
+        for process in remaining_processes:
+            try:
+                os.kill(process["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        closed, remaining_processes, remaining_port_open = wait_for_browser_exit(browser, max(timeout, 0.5))
+
+    if closed:
+        return True, f"✅ 已关闭 {browser['name']} ERP 自动化浏览器"
+
+    details = []
+    if remaining_processes:
+        details.append(f"残留进程: {format_processes(remaining_processes)}")
+    if remaining_port_open:
+        details.append(f"CDP端口 {browser['port']} 仍然可访问")
+    return False, f"❌ 关闭 {browser['name']} 失败: {' | '.join(details) if details else '未通过关闭校验'}"
 
 
 def get_cst_page(browser):
@@ -917,8 +1010,8 @@ def get_default_bill_model_on_page(page, bill_type, group_id=0):
     return info.get("bill") or {}
 
 
-def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False):
-    browser = find_browser(preferred=preferred_browser, require_cst=True)
+def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False, task_id=None):
+    browser = find_browser(preferred=preferred_browser, require_cst=True, task_id=task_id)
     if not browser:
         fallback = get_static_default_bill_model(bill_type, group_id=group_id)
         if fallback:
@@ -992,6 +1085,12 @@ def normalize_company_id(company_id):
     if company_id in (None, "", 0):
         return None
     return int(company_id)
+
+
+def normalize_company_name(company_name):
+    if company_name in (None, ""):
+        return None
+    return "".join(str(company_name).split()).strip() or None
 
 
 def read_credentials(username=None, password=None, company_id=None, prompt=False):
@@ -1113,16 +1212,43 @@ def query_user_companies(token):
     return resp.get("result") or []
 
 
-def choose_company(companies, desired_company_id=None):
+def choose_company(companies, desired_company_id=None, desired_company_name=None):
     desired_company_id = normalize_company_id(desired_company_id)
+    desired_company_name = normalize_company_name(desired_company_name)
     if desired_company_id:
         for company in companies:
             if int(company.get("id")) == desired_company_id:
                 return company
         raise RuntimeError(f"未在企业列表中找到 companyId={desired_company_id}")
+    if desired_company_name:
+        exact_matches = []
+        fuzzy_matches = []
+        for company in companies:
+            names = [
+                normalize_company_name(company.get("name")),
+                normalize_company_name(company.get("shortName")),
+            ]
+            names = [name for name in names if name]
+            if desired_company_name in names:
+                exact_matches.append(company)
+                continue
+            if any(
+                desired_company_name in name or name in desired_company_name
+                for name in names
+            ):
+                fuzzy_matches.append(company)
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if len(exact_matches) > 1:
+            raise RuntimeError(f"企业名称 {desired_company_name} 匹配到多个企业，请改用 company-id")
+        if len(fuzzy_matches) == 1:
+            return fuzzy_matches[0]
+        if len(fuzzy_matches) > 1:
+            raise RuntimeError(f"企业名称 {desired_company_name} 模糊匹配到多个企业，请改用 company-id")
+        raise RuntimeError(f"未在企业列表中找到名称匹配 {desired_company_name} 的企业")
     if len(companies) == 1:
         return companies[0]
-    raise RuntimeError("检测到多个企业，请通过 --company-id 或 CST_COMPANY_ID 指定导入企业")
+    raise RuntimeError("检测到多个企业，请通过 --company-id、CST_COMPANY_ID，或提供集团名称/公司名称 指定导入企业")
 
 
 def click_company_entry(page, company_name):
@@ -1147,13 +1273,75 @@ def click_company_entry(page, company_name):
     return json.loads(result or "{}")
 
 
-def ensure_company_selected(page, desired_company_id=None):
-    token, current_company_id, _, _ = extract_auth(page)
-    if current_company_id:
-        return token, current_company_id
+def force_company_picker_page(page):
+    return cdp_eval(
+        page,
+        f"""
+        (() => {{
+          try {{
+            const raw = JSON.parse(localStorage.getItem('vuex') || '{{}}');
+            if (raw.user) {{
+              raw.user.company = {{}};
+            }}
+            localStorage.setItem('vuex', JSON.stringify(raw));
+          }} catch (e) {{}}
+          location.replace({json.dumps(LOGIN_URL)});
+          return true;
+        }})()
+        """,
+    )
 
+
+def wait_for_company_picker(page, timeout=20):
+    def _ready():
+        raw = cdp_eval(
+            page,
+            """
+            (() => {
+              const hasCompanyCards = [...document.querySelectorAll('.comp button')]
+                .some(btn => (btn.innerText || '').includes('进入企业'));
+              const vuex = JSON.parse(localStorage.getItem('vuex') || '{}');
+              const token = (((vuex || {}).user || {}).token) || null;
+              const companyId = ((((vuex || {}).user || {}).company || {}).id) || null;
+              return JSON.stringify({
+                href: location.href,
+                hasCompanyCards,
+                token: !!token,
+                companyId
+              });
+            })()
+            """,
+        )
+        try:
+            info = json.loads(raw or "{}")
+        except Exception:
+            return None
+        if info.get("hasCompanyCards"):
+            return info
+        if info.get("token") and not info.get("companyId"):
+            return info
+        return None
+
+    return wait_for(_ready, timeout=timeout, interval=1)
+
+
+def ensure_company_selected(page, desired_company_id=None, desired_company_name=None):
+    token, current_company_id, _, data = extract_auth(page)
+    current_company = ((data or {}).get("user") or {}).get("company") or {}
     companies = query_user_companies(token)
-    company = choose_company(companies, desired_company_id=desired_company_id)
+    company = choose_company(
+        companies,
+        desired_company_id=desired_company_id,
+        desired_company_name=desired_company_name,
+    )
+    if current_company_id and int(current_company_id) == int(company["id"]):
+        return token, current_company_id
+    if current_company_id:
+        force_company_picker_page(page)
+        if not wait_for_company_picker(page, timeout=20):
+            raise RuntimeError(
+                f"已登录企业 {current_company.get('name') or current_company_id} 与目标企业 {company.get('name')} 不一致，且未能进入企业选择页"
+            )
     click = click_company_entry(page, company["name"])
     if not click.get("ok"):
         raise RuntimeError(f"进入企业失败：{click}")
@@ -1353,8 +1541,8 @@ def ui_save_bill_template_on_page(page, doc_name):
     }
 
 
-def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False):
-    browser = find_browser(preferred=preferred_browser, require_cst=True)
+def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False, task_id=None):
+    browser = find_browser(preferred=preferred_browser, require_cst=True, task_id=task_id)
     if not browser:
         raise RuntimeError("未找到已登录的财税通浏览器页面，无法执行页面保存")
     page = ensure_bill_template_page(browser, reload_page=reload_page)
@@ -1366,15 +1554,24 @@ def ensure_login(
     username=None,
     password=None,
     company_id=None,
+    company_name=None,
+    force_relogin=False,
+    task_id=None,
     prompt=False,
 ):
-    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL, task_id=task_id)
     if not browser:
         raise RuntimeError("未能自动打开 Edge/Chrome，请确认本机已安装浏览器")
 
     page = ensure_cst_page(browser, url=LOGIN_URL)
     token, selected_company_id, user_id, _ = extract_auth(page)
-    if validate_auth(token, selected_company_id):
+    if validate_auth(token, selected_company_id) and not force_relogin:
+        if selected_company_id and (company_id or company_name):
+            token, selected_company_id = ensure_company_selected(
+                page,
+                desired_company_id=company_id,
+                desired_company_name=company_name,
+            )
         return token, selected_company_id, user_id, browser["name"]
 
     username, password, company_id = read_credentials(
@@ -1407,8 +1604,12 @@ def ensure_login(
         raise RuntimeError("自动登录后未能读取到 token，请检查账号密码是否正确")
 
     token, selected_company_id, user_id = logged_in
-    if not selected_company_id:
-        token, selected_company_id = ensure_company_selected(page, desired_company_id=company_id)
+    if company_id or company_name or not selected_company_id:
+        token, selected_company_id = ensure_company_selected(
+            page,
+            desired_company_id=company_id,
+            desired_company_name=company_name,
+        )
 
     if not validate_auth(token, selected_company_id):
         raise RuntimeError("自动登录完成，但登录态校验未通过")
@@ -1422,9 +1623,12 @@ def get_auth(
     username=None,
     password=None,
     company_id=None,
+    company_name=None,
+    force_relogin=False,
+    task_id=None,
     prompt=False,
 ):
-    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL, task_id=task_id)
     if not browser:
         raise RuntimeError(
             "未检测到可用的浏览器。请安装 Edge 或 Chrome，或使用 --auto-login 让脚本自动打开浏览器。"
@@ -1432,7 +1636,13 @@ def get_auth(
 
     page = ensure_cst_page(browser, url=LOGIN_URL)
     token, selected_company_id, user_id, _ = extract_auth(page)
-    if validate_auth(token, selected_company_id):
+    if validate_auth(token, selected_company_id) and not force_relogin:
+        if selected_company_id and (company_id or company_name):
+            token, selected_company_id = ensure_company_selected(
+                page,
+                desired_company_id=company_id,
+                desired_company_name=company_name,
+            )
         return token, selected_company_id, user_id, browser["name"]
 
     if not auto_login:
@@ -1445,5 +1655,8 @@ def get_auth(
         username=username,
         password=password,
         company_id=company_id,
+        company_name=company_name,
+        force_relogin=force_relogin,
+        task_id=task_id,
         prompt=prompt,
     )

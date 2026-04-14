@@ -28,7 +28,18 @@ SCRIPT_DIR = resolve_browser_session_dir()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.append(str(SCRIPT_DIR))
 
-from browser_session import cdp_eval, ensure_cst_page, find_or_launch_browser, get_auth  # noqa: E402
+from browser_session import (  # noqa: E402
+    cdp_eval,
+    close_browser_instance,
+    ensure_cst_page,
+    extract_auth,
+    find_browser,
+    find_or_launch_browser,
+    get_auth,
+    normalize_company_name,
+)
+from runtime_context import normalize_task_id  # noqa: E402
+from runtime_context import release_browser_runtime  # noqa: E402
 
 
 BASE_URL = "https://cst.uf-tree.com"
@@ -73,25 +84,75 @@ class CSTBrowserRunner:
         username=None,
         password=None,
         company_id=None,
+        company_name=None,
         erp_accounting_id=None,
+        force_relogin=False,
+        task_id=None,
         prompt_credentials=False,
     ):
+        effective_force_relogin = bool(
+            force_relogin or (auto_login and (username or password or company_id or company_name))
+        )
         get_auth(
             auto_login=auto_login,
             preferred_browser=browser_name,
             username=username,
             password=password,
             company_id=company_id,
+            company_name=company_name,
+            force_relogin=effective_force_relogin,
+            task_id=task_id,
             prompt=prompt_credentials,
         )
-        self.browser = find_or_launch_browser(preferred=browser_name, target_url=f"{BASE_URL}/index")
+        self.browser = find_or_launch_browser(preferred=browser_name, target_url=f"{BASE_URL}/index", task_id=task_id)
         if not self.browser:
             raise RuntimeError("未找到可用浏览器。")
         self.page = ensure_cst_page(self.browser, url=f"{BASE_URL}/index")
         self.settle_seconds = settle_seconds
         self.erp_accounting_id = erp_accounting_id
+        self.task_id = normalize_task_id(task_id)
+        self.requested_company_id = company_id
+        self.requested_company_name = company_name
+        self.login_account = username
+        self.current_company = {}
+        self.current_user = {}
         self.current_accounting = None
         self.ensure_home_ready()
+        self.refresh_auth_context()
+        self.assert_company_context()
+
+    def refresh_auth_context(self):
+        _, _, _, data = extract_auth(self.page)
+        user = (data or {}).get("user") or {}
+        self.current_user = user
+        self.current_company = user.get("company") or {}
+        if not self.login_account:
+            self.login_account = user.get("mobile") or user.get("phone") or user.get("username")
+        return self.current_company
+
+    def assert_company_context(self):
+        self.refresh_auth_context()
+        actual_company = self.current_company or {}
+        actual_company_id = actual_company.get("id")
+        actual_names = {
+            normalize_company_name(actual_company.get("name")),
+            normalize_company_name(actual_company.get("shortName")),
+        }
+        actual_names = {name for name in actual_names if name}
+
+        if self.requested_company_id not in (None, "", 0):
+            if int(actual_company_id or 0) != int(self.requested_company_id):
+                raise RuntimeError(
+                    f"实际登录企业ID={actual_company_id}，与要求的 company-id={self.requested_company_id} 不一致"
+                )
+
+        if self.requested_company_name:
+            requested = normalize_company_name(self.requested_company_name)
+            if requested and actual_names and requested not in actual_names:
+                if not any(requested in name or name in requested for name in actual_names):
+                    raise RuntimeError(
+                        f"实际登录企业为 {actual_company.get('name') or actual_company_id}，与要求的公司 {self.requested_company_name} 不一致"
+                    )
 
     def ensure_home_ready(self):
         target_url = f"{BASE_URL}/index"
@@ -545,6 +606,58 @@ def route_vm_eval(runner, route_name, marker_method, body, await_promise=True, t
     raise last_error
 
 
+def build_financial_sync_js(master_expr, button_text="从财务系统同步"):
+    return f"""
+const __readMasterCount = () => ((({master_expr}) || []).length);
+function __isVisible(el) {{
+  if (!el || !el.getClientRects) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.getClientRects().length > 0;
+}}
+function __normalizeButtonText(el) {{
+  return ((el && (el.innerText || el.textContent)) || '').replace(/\\s+/g, ' ').trim();
+}}
+function __findButton(text) {{
+  const buttons = Array.from(document.querySelectorAll('button, .el-button, [role="button"]'));
+  return buttons.find(el => __isVisible(el) && __normalizeButtonText(el) === text)
+    || buttons.find(el => __normalizeButtonText(el) === text)
+    || null;
+}}
+if (typeof vm.fnClickAdd === 'function' && !vm.bIsShowModal) {{
+  vm.fnClickAdd();
+  await new Promise(resolve => setTimeout(resolve, 300));
+}}
+const __syncButton = __findButton({json.dumps(button_text)});
+if (__syncButton) {{
+  __syncButton.click();
+  let __lastMasterCount = __readMasterCount();
+  let __stableTicks = 0;
+  const __deadline = Date.now() + 12000;
+  while (Date.now() < __deadline) {{
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const __currentMasterCount = __readMasterCount();
+    if (__currentMasterCount !== __lastMasterCount) {{
+      __lastMasterCount = __currentMasterCount;
+      __stableTicks = 0;
+      continue;
+    }}
+    __stableTicks += 1;
+    if (__stableTicks >= 3) break;
+  }}
+}}
+if (vm.bIsShowModal) {{
+  const __cancelButton = __findButton('取消');
+  if (__cancelButton) {{
+    __cancelButton.click();
+    const __closeDeadline = Date.now() + 5000;
+    while (vm.bIsShowModal && Date.now() < __closeDeadline) {{
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }}
+  }}
+}}
+"""
+
+
 def fetch_department_data(runner):
     return route_vm_eval(
         runner,
@@ -553,6 +666,9 @@ def fetch_department_data(runner):
         """
 await vm.fnNetRRelationList();
 await vm.fnNetRList();
+"""
+        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + """
 return {
   relation: vm.aRelationList,
   master: vm.aAllList || vm.aList
@@ -583,6 +699,9 @@ def fetch_project_data(runner):
         """
 await vm.fnNetRRelationList();
 await vm.fnNetRList();
+"""
+        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + """
 return {
   relation: vm.aRelationList,
   master: vm.aAllList || vm.aList
@@ -613,6 +732,9 @@ def fetch_staff_data(runner):
         """
 await vm.fnNetRRelationList();
 await vm.fnNetRList();
+"""
+        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + """
 return {
   relation: vm.aRelationList,
   master: vm.aAllList || vm.aList
@@ -644,6 +766,9 @@ def fetch_provider_data(runner):
 vm.cur = 'relation';
 await vm.fnNetRRelationList();
 await vm.fnNetRList();
+"""
+        + build_financial_sync_js("vm.providerAllList")
+        + """
 const bankRelation = vm.aRelationList;
 vm.cur = 'receivePayAccount';
 await vm.fnNetRRelationList();
@@ -1039,118 +1164,173 @@ def run(
     username=None,
     password=None,
     company_id=None,
+    company_name=None,
     erp_accounting_id=None,
+    force_relogin=False,
+    task_id=None,
+    close_browser=False,
+    close_timeout=5.0,
     prompt_credentials=False,
 ):
-    runner = CSTBrowserRunner(
-        browser_name=browser_name,
-        auto_login=auto_login,
-        username=username,
-        password=password,
-        company_id=company_id,
-        erp_accounting_id=erp_accounting_id,
-        prompt_credentials=prompt_credentials,
-    )
-    runner.ensure_erp_archive_context()
-    report = {
-        "applied": apply_changes,
-        "erp_accounting": runner.current_accounting,
-        "steps": [],
-    }
+    runner = None
+    report = None
+    error = None
+    try:
+        runner = CSTBrowserRunner(
+            browser_name=browser_name,
+            auto_login=auto_login,
+            username=username,
+            password=password,
+            company_id=company_id,
+            company_name=company_name,
+            erp_accounting_id=erp_accounting_id,
+            force_relogin=force_relogin,
+            task_id=task_id,
+            prompt_credentials=prompt_credentials,
+        )
+        runner.ensure_erp_archive_context()
+        report = {
+            "applied": apply_changes,
+            "task_id": runner.task_id,
+            "login_account": runner.login_account,
+            "login_company": runner.current_company,
+            "requested_company_name": company_name,
+            "erp_accounting": runner.current_accounting,
+            "browser": runner.browser["name"],
+            "steps": [],
+        }
 
-    subject_data = fetch_subject_data(runner)
-    subject_plan = build_subject_payloads(subject_data)
-    subject_step = {
-        "step": "subject",
-        "pay_apply_count": len(subject_plan["pay_payload"]),
-        "pay_skip_count": len(subject_plan["pay_skipped"]),
-        "income_apply_count": len(subject_plan["income_payload"]),
-        "income_skip_count": len(subject_plan["income_skipped"]),
-        "pay_paths": [item["path"] for item in subject_plan["pay_skipped"]],
-        "income_paths": [item["path"] for item in subject_plan["income_skipped"]],
-    }
-    if apply_changes and (subject_plan["pay_payload"] or subject_plan["income_payload"]):
-        save_subject_mappings(runner, subject_plan["pay_payload"], subject_plan["income_payload"])
-        subject_step["saved"] = True
-    report["steps"].append(subject_step)
+        subject_data = fetch_subject_data(runner)
+        subject_plan = build_subject_payloads(subject_data)
+        subject_step = {
+            "step": "subject",
+            "pay_apply_count": len(subject_plan["pay_payload"]),
+            "pay_skip_count": len(subject_plan["pay_skipped"]),
+            "income_apply_count": len(subject_plan["income_payload"]),
+            "income_skip_count": len(subject_plan["income_skipped"]),
+            "pay_paths": [item["path"] for item in subject_plan["pay_skipped"]],
+            "income_paths": [item["path"] for item in subject_plan["income_skipped"]],
+        }
+        if apply_changes and (subject_plan["pay_payload"] or subject_plan["income_payload"]):
+            save_subject_mappings(runner, subject_plan["pay_payload"], subject_plan["income_payload"])
+            subject_step["saved"] = True
+        report["steps"].append(subject_step)
 
-    provider_data = fetch_provider_data(runner)
-    provider_plan = build_provider_payloads(provider_data)
-    provider_step = {
-        "step": "provider",
-        "bank_apply_count": len(provider_plan["bank_payload"]),
-        "bank_skip_count": len(provider_plan["bank_skipped"]),
-        "pay_apply_count": len(provider_plan["pay_payload"]),
-        "pay_skip_count": len(provider_plan["pay_skipped"]),
-        "customer_apply_count": len(provider_plan["customer_rows"]),
-        "customer_skip_count": len(provider_plan["customer_skipped"]),
-        "customer_skipped": provider_plan["customer_skipped"],
-    }
-    if apply_changes and provider_plan["bank_payload"]:
-        save_provider_bank_mappings(runner, strip_meta(provider_plan["bank_payload"]), "BANKCARD")
-        provider_step["bank_saved"] = True
-    if apply_changes and provider_plan["pay_payload"]:
-        save_provider_bank_mappings(runner, strip_meta(provider_plan["pay_payload"]), "PAYACCOUNT")
-        provider_step["pay_saved"] = True
-    if apply_changes and provider_plan["customer_rows"]:
-        save_provider_customer_rows(runner, provider_plan["customer_rows"])
-        provider_step["customer_saved"] = True
-    report["steps"].append(provider_step)
+        provider_data = fetch_provider_data(runner)
+        provider_plan = build_provider_payloads(provider_data)
+        provider_step = {
+            "step": "provider",
+            "bank_apply_count": len(provider_plan["bank_payload"]),
+            "bank_skip_count": len(provider_plan["bank_skipped"]),
+            "pay_apply_count": len(provider_plan["pay_payload"]),
+            "pay_skip_count": len(provider_plan["pay_skipped"]),
+            "customer_apply_count": len(provider_plan["customer_rows"]),
+            "customer_skip_count": len(provider_plan["customer_skipped"]),
+            "customer_skipped": provider_plan["customer_skipped"],
+        }
+        if apply_changes and provider_plan["bank_payload"]:
+            save_provider_bank_mappings(runner, strip_meta(provider_plan["bank_payload"]), "BANKCARD")
+            provider_step["bank_saved"] = True
+        if apply_changes and provider_plan["pay_payload"]:
+            save_provider_bank_mappings(runner, strip_meta(provider_plan["pay_payload"]), "PAYACCOUNT")
+            provider_step["pay_saved"] = True
+        if apply_changes and provider_plan["customer_rows"]:
+            save_provider_customer_rows(runner, provider_plan["customer_rows"])
+            provider_step["customer_saved"] = True
+        report["steps"].append(provider_step)
 
-    staff_data = fetch_staff_data(runner)
-    staff_payload, staff_skipped = build_staff_payload(staff_data)
-    staff_step = {
-        "step": "staff",
-        "apply_count": len(staff_payload),
-        "skip_count": len(staff_skipped),
-        "skipped": staff_skipped,
-    }
-    if apply_changes and staff_payload:
-        save_staff_mappings(runner, strip_meta(staff_payload))
-        staff_step["saved"] = True
-    report["steps"].append(staff_step)
+        staff_data = fetch_staff_data(runner)
+        staff_payload, staff_skipped = build_staff_payload(staff_data)
+        staff_step = {
+            "step": "staff",
+            "apply_count": len(staff_payload),
+            "skip_count": len(staff_skipped),
+            "skipped": staff_skipped,
+        }
+        if apply_changes and staff_payload:
+            save_staff_mappings(runner, strip_meta(staff_payload))
+            staff_step["saved"] = True
+        report["steps"].append(staff_step)
 
-    project_data = fetch_project_data(runner)
-    project_payload, project_skipped = build_project_payload(project_data)
-    project_step = {
-        "step": "project",
-        "apply_count": len(project_payload),
-        "skip_count": len(project_skipped),
-        "skipped": project_skipped,
-    }
-    if apply_changes and project_payload:
-        save_project_mappings(runner, strip_meta(project_payload))
-        project_step["saved"] = True
-    report["steps"].append(project_step)
+        project_data = fetch_project_data(runner)
+        project_payload, project_skipped = build_project_payload(project_data)
+        project_step = {
+            "step": "project",
+            "apply_count": len(project_payload),
+            "skip_count": len(project_skipped),
+            "skipped": project_skipped,
+        }
+        if apply_changes and project_payload:
+            save_project_mappings(runner, strip_meta(project_payload))
+            project_step["saved"] = True
+        report["steps"].append(project_step)
 
-    department_data = fetch_department_data(runner)
-    department_payload, department_skipped = build_department_payload(department_data)
-    department_step = {
-        "step": "department",
-        "apply_count": len(department_payload),
-        "skip_count": len(department_skipped),
-        "skipped": department_skipped,
-    }
-    if apply_changes and department_payload:
-        save_department_mappings(runner, strip_meta(department_payload))
-        department_step["saved"] = True
-    report["steps"].append(department_step)
+        department_data = fetch_department_data(runner)
+        department_payload, department_skipped = build_department_payload(department_data)
+        department_step = {
+            "step": "department",
+            "apply_count": len(department_payload),
+            "skip_count": len(department_skipped),
+            "skipped": department_skipped,
+        }
+        if apply_changes and department_payload:
+            save_department_mappings(runner, strip_meta(department_payload))
+            department_step["saved"] = True
+        report["steps"].append(department_step)
+    except Exception as exc:
+        error = exc
+        if report is None:
+            report = {
+                "applied": apply_changes,
+                "task_id": normalize_task_id(task_id),
+                "login_account": (runner.login_account if runner is not None else username),
+                "login_company": (runner.current_company if runner is not None else {}),
+                "requested_company_name": company_name,
+                "erp_accounting": (runner.current_accounting if runner is not None else None),
+                "browser": (runner.browser["name"] if runner is not None else browser_name),
+                "steps": [],
+                "error": str(exc),
+            }
+    finally:
+        if close_browser:
+            target_browser = runner.browser if runner is not None else find_browser(
+                preferred=browser_name,
+                require_cst=False,
+                task_id=task_id,
+            )
+            if target_browser:
+                close_ok, close_message = close_browser_instance(target_browser, timeout=close_timeout)
+                if close_ok and normalize_task_id(task_id):
+                    release_browser_runtime(task_id, browser_id=target_browser["id"])
+            else:
+                close_ok, close_message = True, "ℹ️ 未发现 ERP 自动化浏览器需要关闭"
+            if report is not None:
+                report["browser_close"] = {
+                    "ok": close_ok,
+                    "message": close_message,
+                }
+        if report_path and report is not None:
+            Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2))
 
-    if report_path:
-        Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    if error is not None:
+        raise error
     return report
 
 
 def main():
     parser = argparse.ArgumentParser(description="Configure 财税通 ERP archive mappings from the current Edge session.")
-    default_report = Path(__file__).resolve().parent.parent / "cst_live_mapper_report.json"
     parser.add_argument("--apply", action="store_true", help="actually save mappings")
     parser.add_argument("--browser", default="edge", help="browser to attach to")
     parser.add_argument("--auto-login", action="store_true", help="launch browser and login automatically if needed")
     parser.add_argument("--username", help="财税通登录手机号; defaults to CST_USERNAME")
     parser.add_argument("--password", help="财税通登录密码; defaults to CST_PASSWORD")
     parser.add_argument("--company-id", type=int, help="企业 ID; only needed when the account can enter multiple enterprises")
+    parser.add_argument("--company-name", help="企业名称; 无法提供 company-id 时用于强制选定企业")
     parser.add_argument("--erp-accounting-id", type=int, help="ERP账套 ID; required only when the account has multiple ERP账套")
+    parser.add_argument("--task-id", help="任务隔离 ID；同一 taskId 会复用同一浏览器实例")
+    parser.add_argument("--fresh-login", action="store_true", help="忽略当前登录态，强制重新登录")
+    parser.add_argument("--close-browser", action="store_true", help="执行完成后关闭 finance.ERP 专用自动化浏览器")
+    parser.add_argument("--close-timeout", type=float, default=5.0, help="关闭浏览器后的校验秒数，默认 5")
     parser.add_argument(
         "--prompt-credentials",
         action="store_true",
@@ -1158,20 +1338,32 @@ def main():
     )
     parser.add_argument(
         "--report",
-        default=str(default_report),
+        default=None,
         help="where to write the JSON summary",
     )
     args = parser.parse_args()
+    normalized_task_id = normalize_task_id(args.task_id)
+    default_report = Path(__file__).resolve().parent.parent / "reports"
+    default_report.mkdir(parents=True, exist_ok=True)
+    report_path = args.report
+    if not report_path:
+        suffix = normalized_task_id or "default"
+        report_path = str(default_report / f"cst_live_mapper_report_{suffix}.json")
 
     report = run(
         apply_changes=args.apply,
         browser_name=args.browser,
-        report_path=args.report,
+        report_path=report_path,
         auto_login=args.auto_login,
         username=args.username,
         password=args.password,
         company_id=args.company_id,
+        company_name=args.company_name,
         erp_accounting_id=args.erp_accounting_id,
+        task_id=args.task_id,
+        force_relogin=args.fresh_login,
+        close_browser=args.close_browser,
+        close_timeout=args.close_timeout,
         prompt_credentials=args.prompt_credentials,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
