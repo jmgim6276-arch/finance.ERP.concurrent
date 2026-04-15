@@ -658,6 +658,141 @@ if (vm.bIsShowModal) {{
 """
 
 
+def build_pagination_collectors_js():
+    return """
+function __sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+function __isVisible(el) {
+  if (!el || !el.getClientRects) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.getClientRects().length > 0;
+}
+function __normalizeText(value) {
+  return String(value || '').replace(/\\s+/g, ' ').trim();
+}
+function __findButton(text, root) {
+  const scope = root || document;
+  const buttons = Array.from(scope.querySelectorAll('button, .el-button, [role="button"]'));
+  return buttons.find(el => __isVisible(el) && __normalizeText(el.innerText || el.textContent) === text)
+    || buttons.find(el => __normalizeText(el.innerText || el.textContent) === text)
+    || null;
+}
+function __visibleDialog() {
+  return Array.from(document.querySelectorAll('.el-dialog__wrapper, .el-dialog')).find(__isVisible) || null;
+}
+function __findPager(root) {
+  const scope = root || document;
+  return Array.from(scope.querySelectorAll('.el-pagination')).find(__isVisible) || null;
+}
+function __activePage(pager) {
+  const active = pager && pager.querySelector('.el-pager .active');
+  return __normalizeText(active && active.textContent);
+}
+function __nextEnabled(pager) {
+  const nextBtn = pager && pager.querySelector('.btn-next');
+  if (!nextBtn) return false;
+  return !nextBtn.disabled && !nextBtn.classList.contains('is-disabled') && nextBtn.getAttribute('disabled') === null;
+}
+function __stableItemKey(item) {
+  if (item == null) return 'null';
+  if (item.feeTemplateId != null) return `fee:${item.feeTemplateId}`;
+  if (item.id != null) return `id:${item.id}`;
+  if (item.subject && item.subject.id != null) return `subject:${item.subject.id}`;
+  if (item.eccloudData && item.eccloudData.id != null) return `ec:${item.eccloudData.id}`;
+  if (item.financialData && item.financialData.id != null) return `fin:${item.financialData.id}`;
+  return JSON.stringify(item);
+}
+function __cloneItems(items) {
+  return JSON.parse(JSON.stringify(items || []));
+}
+function __itemsSignature(items) {
+  return __cloneItems(items).map(__stableItemKey).join('|');
+}
+function __dedupeItems(items) {
+  const out = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const key = __stableItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+async function __waitForPageChange(pager, beforePage, beforeSignature, getItems) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    await __sleep(250);
+    const currentPage = __activePage(pager);
+    const currentSignature = __itemsSignature(getItems());
+    if (currentPage !== beforePage || currentSignature !== beforeSignature) {
+      await __sleep(250);
+      return true;
+    }
+  }
+  return false;
+}
+async function __collectPagedItems(getItems, root) {
+  const all = [];
+  let guard = 0;
+  while (guard++ < 50) {
+    const currentItems = __cloneItems(getItems());
+    all.push(...currentItems);
+    const pager = __findPager(root);
+    if (!pager || !__nextEnabled(pager)) break;
+    const beforePage = __activePage(pager);
+    const beforeSignature = __itemsSignature(currentItems);
+    const nextBtn = pager.querySelector('.btn-next');
+    nextBtn.click();
+    const moved = await __waitForPageChange(pager, beforePage, beforeSignature, getItems);
+    if (!moved) break;
+  }
+  return __dedupeItems(all);
+}
+async function __closeModalIfOpen() {
+  if (!vm.bIsShowModal) return;
+  const dialog = __visibleDialog() || document;
+  const cancelButton = __findButton('取消', dialog) || __findButton('关闭', dialog);
+  if (cancelButton) {
+    cancelButton.click();
+    const deadline = Date.now() + 5000;
+    while (vm.bIsShowModal && Date.now() < deadline) {
+      await __sleep(200);
+    }
+  }
+}
+async function __syncAndCollectMaster(getItems, buttonText) {
+  if (typeof vm.fnClickAdd === 'function' && !vm.bIsShowModal) {
+    vm.fnClickAdd();
+    await __sleep(300);
+  }
+  const dialog = __visibleDialog() || document;
+  const syncButton = __findButton(buttonText || '从财务系统同步', dialog) || __findButton(buttonText || '从财务系统同步', document);
+  if (syncButton) {
+    syncButton.click();
+    let lastCount = (getItems() || []).length;
+    let stableTicks = 0;
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      await __sleep(300);
+      const currentCount = (getItems() || []).length;
+      if (__normalizeText(currentCount) !== __normalizeText(lastCount)) {
+        lastCount = currentCount;
+        stableTicks = 0;
+        continue;
+      }
+      stableTicks += 1;
+      if (stableTicks >= 3) break;
+    }
+  }
+  const items = await __collectPagedItems(getItems, __visibleDialog() || dialog);
+  await __closeModalIfOpen();
+  return items;
+}
+"""
+
+
 def fetch_department_data(runner):
     return route_vm_eval(
         runner,
@@ -665,13 +800,15 @@ def fetch_department_data(runner):
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
-await vm.fnNetRList();
 """
-        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + build_pagination_collectors_js()
         + """
+const relation = await __collectPagedItems(() => vm.aRelationList || []);
+await vm.fnNetRList();
+const master = await __syncAndCollectMaster(() => vm.aAllList || vm.aList || []);
 return {
-  relation: vm.aRelationList,
-  master: vm.aAllList || vm.aList
+  relation,
+  master: master.length ? master : (vm.aAllList || vm.aList || [])
 };
 """,
     )
@@ -698,13 +835,15 @@ def fetch_project_data(runner):
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
-await vm.fnNetRList();
 """
-        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + build_pagination_collectors_js()
         + """
+const relation = await __collectPagedItems(() => vm.aRelationList || []);
+await vm.fnNetRList();
+const master = await __syncAndCollectMaster(() => vm.aAllList || vm.aList || []);
 return {
-  relation: vm.aRelationList,
-  master: vm.aAllList || vm.aList
+  relation,
+  master: master.length ? master : (vm.aAllList || vm.aList || [])
 };
 """,
     )
@@ -731,13 +870,15 @@ def fetch_staff_data(runner):
         "fnNetRelateItems",
         """
 await vm.fnNetRRelationList();
-await vm.fnNetRList();
 """
-        + build_financial_sync_js("vm.aAllList || vm.aList")
+        + build_pagination_collectors_js()
         + """
+const relation = await __collectPagedItems(() => vm.aRelationList || []);
+await vm.fnNetRList();
+const master = await __syncAndCollectMaster(() => vm.aAllList || vm.aList || []);
 return {
-  relation: vm.aRelationList,
-  master: vm.aAllList || vm.aList
+  relation,
+  master: master.length ? master : (vm.aAllList || vm.aList || [])
 };
 """,
     )
@@ -765,20 +906,22 @@ def fetch_provider_data(runner):
         """
 vm.cur = 'relation';
 await vm.fnNetRRelationList();
-await vm.fnNetRList();
 """
-        + build_financial_sync_js("vm.providerAllList")
+        + build_pagination_collectors_js()
         + """
-const bankRelation = vm.aRelationList;
+const bankRelation = await __collectPagedItems(() => vm.aRelationList || []);
+await vm.fnNetRList();
+const providerMaster = await __syncAndCollectMaster(() => vm.providerAllList || []);
 vm.cur = 'receivePayAccount';
 await vm.fnNetRRelationList();
-const payRelation = vm.aRelationList;
+const payRelation = await __collectPagedItems(() => vm.aRelationList || []);
 await vm.fnNetCustomerRelationList();
+const customerRelation = await __collectPagedItems(() => vm.cRelationList || []);
 return {
   bankRelation,
   payRelation,
-  customerRelation: vm.cRelationList,
-  providerMaster: vm.providerAllList,
+  customerRelation,
+  providerMaster: providerMaster.length ? providerMaster : (vm.providerAllList || []),
   customerMaster: vm.customerAllList
 };
 """,
@@ -823,9 +966,25 @@ def fetch_subject_data(runner):
         "subject",
         "fnNetSavePayRelateItems",
         """
-await vm.fnNetPayRelationList(1);
-await vm.fnNetIncomeRelationList(1);
+"""
+        + build_pagination_collectors_js()
+        + """
 await vm.fnSyncAllSubject();
+
+async function loadPagedRoots(loadFn, readPageConf, readItems) {
+  await loadFn(1);
+  const firstItems = __cloneItems(readItems());
+  const conf = readPageConf() || {};
+  const pageSize = Number(conf.pageSize || firstItems.length || 1);
+  const totalCount = Number(conf.totalCount || firstItems.length || 0);
+  const totalPages = Math.max(1, Math.ceil(totalCount / Math.max(pageSize, 1)));
+  const all = [...firstItems];
+  for (let page = 2; page <= totalPages; page += 1) {
+    await loadFn(page);
+    all.push(...__cloneItems(readItems()));
+  }
+  return __dedupeItems(all);
+}
 
 async function loadPay(nodes, path = [], out = []) {
   for (const row of nodes || []) {
@@ -872,10 +1031,20 @@ function walkSubjects(nodes, path = [], out = []) {
 
 const subjectResp = await vm.$dc.erp.fnNetQueryAllSubjectTree({ accountingId: vm.accountingId });
 const subjectTree = (subjectResp && subjectResp.result) || [];
+const payRoots = await loadPagedRoots(
+  page => vm.fnNetPayRelationList(page),
+  () => vm.payRelationPageConf,
+  () => vm.payRelationList || []
+);
+const incomeRoots = await loadPagedRoots(
+  page => vm.fnNetIncomeRelationList(page),
+  () => vm.incomeRelationPageConf,
+  () => vm.incomeRelationList || []
+);
 
 return {
-  pay: await loadPay(vm.payRelationList || []),
-  income: await loadIncome(vm.incomeRelationList || []),
+  pay: await loadPay(payRoots),
+  income: await loadIncome(incomeRoots),
   subjects: walkSubjects(subjectTree)
 };
 """,
