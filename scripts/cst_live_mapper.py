@@ -51,6 +51,11 @@ def normalize_text(value):
     return re.sub(r"\s+", "", str(value)).strip()
 
 
+def is_inactive_staff_name(value):
+    normalized = normalize_text(value)
+    return "已离职" in normalized if normalized else False
+
+
 def unique_index(items, key_fn):
     buckets = defaultdict(list)
     for item in items:
@@ -354,14 +359,33 @@ class CSTBrowserRunner:
         while time.time() < deadline:
             last_state = self.eval(
                 """
-(() => ({
-  href: location.href,
-  title: document.title,
-  readyState: document.readyState
-}))()
+(() => {
+  const nodes = Array.from(document.querySelectorAll('*'));
+  let hasAccountingVm = false;
+  for (const el of nodes) {
+    const vm = el && el.__vue__;
+    const methods = (vm && vm.$options && vm.$options.methods) || {};
+    if (typeof methods.archiveSetting === 'function' || typeof methods.fnNetRTableData === 'function') {
+      hasAccountingVm = true;
+      break;
+    }
+  }
+  return {
+    href: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    bodyTextLength: ((document.body && document.body.innerText) || '').trim().length,
+    hasAccountingVm
+  };
+})()
 """
             )
-            if "/erp/erpAccounting" in str((last_state or {}).get("href", "")):
+            href = str((last_state or {}).get("href", ""))
+            title = str((last_state or {}).get("title", ""))
+            if (
+                "/erp/erpAccounting" in href
+                or (title == "ERP账套" and bool((last_state or {}).get("hasAccountingVm")))
+            ):
                 time.sleep(self.settle_seconds)
                 return
             time.sleep(0.5)
@@ -1149,12 +1173,29 @@ def build_project_payload(data):
 
 
 def build_staff_payload(data):
-    master_index = unique_index(data["master"], lambda item: normalize_text(item.get("userName")))
+    master_index = unique_index(
+        [item for item in data["master"] if not is_inactive_staff_name(item.get("userName"))],
+        lambda item: normalize_text(item.get("userName")),
+    )
     payload = []
     skipped = []
     for row in data["relation"]:
         ec = row["eccloudData"]
         current_id = (row.get("financialData") or {}).get("id")
+        if is_inactive_staff_name(ec.get("name")):
+            if current_id is not None:
+                payload.append(
+                    {
+                        "eccloudId": ec["id"],
+                        "financialId": 0,
+                        "accountingId": data["master"][0]["accountingId"] if data["master"] else None,
+                        "_eccloudName": ec.get("name"),
+                        "_financialName": None,
+                        "_reason": "clear_inactive_staff",
+                    }
+                )
+            skipped.append({"name": ec.get("name"), "reason": "inactive_staff"})
+            continue
         candidate = master_index.get(normalize_text(ec.get("name")))
         if candidate is None:
             if current_id is not None:
